@@ -124,4 +124,54 @@ grep -q '^SMOKE_SET_B' "$work/synth_gsa.gsa.out" || {
 echo "genes analyzed: $(($(wc -l < "$work/synth_gene.genes.out") - 1))"
 grep '^SMOKE_SET' "$work/synth_gsa.gsa.out"
 
+# Batch regression: the node's batches>1 path (official --batch + --merge)
+# must produce the same gene count as a single run, and its merged
+# .genes.raw must remain consumable by --gene-results.
+cp "$root/scripts/gene_analysis.sh" "$work/gene_analysis.sh"
+
+node_gene_analysis() { # node_gene_analysis <batches>
+  podman run --rm \
+    -v "$ref_dir:/panels/magma_ref:ro" \
+    -v "$work:/work" -w /work \
+    --entrypoint sh "$image" -c '
+      : > /work/ga.log; : > /work/ga.genes.out; : > /work/ga.genes.raw
+      AUTONOMICS_INPUT0=/work/pval.tsv \
+      AUTONOMICS_INPUT1=/work/synth.genes.annot \
+      AUTONOMICS_WORKDIR=/work \
+      AUTONOMICS_OUTPUT0=/work/ga.genes.out \
+      AUTONOMICS_OUTPUT1=/work/ga.genes.raw \
+      AUTONOMICS_OUTPUT2=/work/ga.log \
+      MAGMA_GENE_MODEL=snp-wise=mean MAGMA_TOP_N= MAGMA_SAMPLE_SIZE=1000 \
+      MAGMA_BATCHES="$1" sh /work/gene_analysis.sh
+    ' _ "$1"
+}
+
+echo "checking batched gene analysis (batches=4)"
+node_gene_analysis 4 || {
+  echo "batched gene analysis failed; node log:" >&2
+  cat "$work/ga.log" >&2
+  exit 1
+}
+single_genes=$(($(wc -l < "$work/synth_gene.genes.out") - 1))
+batch_genes=$(($(wc -l < "$work/ga.genes.out") - 1))
+[ "$batch_genes" -eq "$single_genes" ] || {
+  echo "batched run analysed $batch_genes genes, single run $single_genes" >&2
+  exit 1
+}
+[ -s "$work/ga.genes.raw" ] || {
+  echo "batched run produced no merged .genes.raw" >&2
+  exit 1
+}
+echo "  batched genes match: $batch_genes"
+
+run --gene-results /work/ga.genes.raw \
+  --set-annot /work/sets.txt \
+  --out /work/batched_gsa >/dev/null
+grep -q '^SMOKE_SET_A' "$work/batched_gsa.gsa.out" || {
+  echo "GSA on the merged .genes.raw produced no result row" >&2
+  cat "$work/batched_gsa.log" >&2
+  exit 1
+}
+echo "  merged .genes.raw feeds --gene-results"
+
 echo "MAGMA gene set test completed successfully."

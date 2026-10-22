@@ -29,26 +29,62 @@ kind = "magma_annotate"
 desc = "Runs official MAGMA v1.10 SNP-to-gene annotation in Podman."
 doc = """
 Runs the official MAGMA v1.10 static executable as an ephemeral Podman
-container. Input is one whitespace/tab-delimited SNP location File with
-SNP, chromosome, and base-pair columns. The node binds the official
-NCBI37.3 gene-location catalog package, invokes `magma --annotate`, and
-emits the raw MAGMA log plus `.genes.annot` as immutable VFS File
-artifacts. Window extension is intentionally not exposed because this
-upstream command annotates against the supplied gene-location table.
+container. The node binds the official NCBI37.3 gene-location catalog
+package, invokes `magma --annotate`, and emits the raw MAGMA log plus
+`.genes.annot` as immutable VFS File artifacts.
+
+INPUT CONTRACT — the file is read POSITIONALLY, and the first three
+whitespace/tab-separated fields MUST be SNP ID, chromosome, and base-pair
+position (extra trailing columns are ignored; a PLINK .bim file is also
+accepted as-is, where column 2 is the SNP ID). Two failure modes to avoid:
+
+- Do NOT feed a standard GWAS/LDSC summary-statistics table. Those lead
+  with `SNP A1 A2 FRQ BETA SE P ...`, so MAGMA reads the A1 allele
+  ("T"/"A"/"C"/"G") as the chromosome code and rejects every SNP: the run
+  exits non-zero with "found no valid SNPs in file", or worse, warns per
+  SNP and yields an empty annotation. Derive the three-column file first
+  (join sumstats to the reference .bim by rsID), or use the 1000G .bim.
+- Base-pair positions MUST be GRCh37/hg19, matching NCBI37.3. GRCh38
+  positions do not fail loudly: they match almost nothing and MAGMA
+  terminates with no valid SNPs, while a partially-overlapping input
+  yields a quietly underpowered annotation (few SNPs per gene, weak
+  p-values) with exit code 0. There is no coordinate lifting in this
+  node.
+
+GENOME-BUILD CHECK: every base-pair position must lie within 22,601,000
+(GRCh37 chr1 length) to 308,832,240 (GRCh38 chr1 length); positions beyond
+that bound are near-certainly GRCh38 and are rejected with an explicit
+error instead of a silent near-empty result.
+
+`window_kb` is the official MAGMA annotation window in KILOBASES
+(`--annotate window=N`, default 10 = 1000bp; 0 disables it). It widens the
+gene region symmetrically (or `up,down` when `ignore_strand` is set). This
+is the MAGMA 1.10 flag name; `--gene-annot-window` does not exist in the
+binary.
 """
 timeout_secs = 300
 artifact_prefix = "/artifacts/magma_annotate"
 
 [nodes.ports]
 inputs = [{ type = "file" }]
+# format = "tsv" (not a family-specific tag) so this output can wire
+# straight into magma_gene_analysis / magma_gene_set input ports in one DAG.
 outputs = [
   { path = "magma_annotate.log", format = "magma_log" },
-  { path = "magma_annotate.genes.annot", format = "magma_genes_annot" },
+  { path = "magma_annotate.genes.annot", format = "tsv" },
 ]
+
+[nodes.params]
+window_kb = { type = "int", default = 10, min = 0.0, max = 1000.0, doc = "Official MAGMA annotation window in kilobases (--annotate window=N); 0 disables the window" }
+ignore_strand = { type = "bool", default = false, doc = "Treat all genes as on the positive strand, making window_kb=up,down strand-insensitive" }
 
 [nodes.command]
 interpreter = "sh"
 script_file = "scripts/annotate.sh"
+
+[nodes.command.env]
+MAGMA_ANNOT_WINDOW_KB = "{{ window_kb }}"
+MAGMA_ANNOT_IGNORE_STRAND = "{{ ignore_strand }}"
 
 [[nodes]]
 kind = "magma_gene_analysis"
@@ -83,6 +119,17 @@ Parameters:
   the K most significant SNPs; it is rejected for any other model.
 - sample_size is the fixed GWAS N passed as N=... when the sumstats carry
   no N column (required then; ignored when they do).
+- batches (default 1) splits the gene analysis across N concurrent
+  official --batch runs that the node merges with --merge. MAGMA v1.10 is
+  single-threaded with no thread flag, so this is the only way to use more
+  than one core. The v1.10 manual caps batch mode at roughly 25-30
+  batches (the limit comes from the gene-gene correlation computation,
+  which --genes-only would remove but gene-set analysis needs it); keep
+  batches well under that. Merged results carry the same filenames and
+  columns as a single run, so outputs are unchanged. Note the gene-level
+  Z-scores are numerically stable only to about 1e-4 between runs —
+  repeat runs of the multi model differ by the same order, so this is the
+  model's own jitter, not a batching artefact.
 
 Outputs: port 0 magma_gene_analysis.genes.out (GENE, CHR, START, STOP,
 NSNPS, NPARAM, N, ZSTAT, P; multi also reports the component p-values),
@@ -100,8 +147,8 @@ inputs = [
   { type = "file", label = "gene_annotation", accepted_formats = ["tsv", "txt"] },
 ]
 outputs = [
-  { path = "magma_gene_analysis.genes.out", format = "magma_genes_out" },
-  { path = "magma_gene_analysis.genes.raw", format = "magma_genes_raw" },
+  { path = "magma_gene_analysis.genes.out", format = "tsv" },
+  { path = "magma_gene_analysis.genes.raw", format = "tsv" },
   { path = "magma_gene_analysis.log", format = "magma_log" },
 ]
 
@@ -111,6 +158,7 @@ outputs = [
 model = { type = "string", default = "multi", doc = "Official --gene-model value: multi (aggregate of mean and top), snp-wise=mean, or snp-wise=top" }
 top_n = { type = "int", optional = true, min = 1.0, doc = "Mean of the K most significant SNPs; requires and decorates model=snp-wise=top" }
 sample_size = { type = "int", optional = true, min = 1.0, doc = "Fixed GWAS sample size for MAGMA N=...; required when the sumstats have no N column" }
+batches = { type = "int", default = 1, min = 1.0, max = 8.0, doc = "Split the gene analysis across N concurrent official --batch runs, merged with --merge; 1 runs MAGMA once" }
 
 [nodes.command]
 interpreter = "sh"
@@ -120,15 +168,15 @@ script_file = "scripts/gene_analysis.sh"
 MAGMA_GENE_MODEL = "{{ model }}"
 MAGMA_TOP_N = "{{ top_n }}"
 MAGMA_SAMPLE_SIZE = "{{ sample_size }}"
+MAGMA_BATCHES = "{{ batches }}"
 
-# Whole-genome reference load (22.3M SNPs, 2.9GB .bed) plus per-gene
-# regression. The earlier dev-lifecycle attempt observed the multi model
-# exceeding 8Gi on dense chromosomes with a per-chromosome panel; the
-# whole-genome panel loads the same per-chromosome windows, so 16Gi keeps
-# headroom.
+# Each concurrent batch is its own MAGMA process with its own reference
+# load (measured ~1.4GB peak on a 5.6k-SNP / 2.2k-gene subset), so memory
+# must cover batches x per-process peak. The node caps batches at 8;
+# 32Gi leaves headroom for full-scale runs on all 19,427 genes.
 [nodes.resources]
-cpus = 2.0
-memory = "16Gi"
+cpus = 8.0
+memory = "32Gi"
 pids_limit = 512
 
 [[nodes]]
