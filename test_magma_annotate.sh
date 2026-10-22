@@ -85,6 +85,7 @@ if [[ "$publish_panel" == 1 ]]; then
     --metadata description="Official MAGMA NCBI37.3 gene location table"
   catalog validate "$work/package"
   catalog publish "$work/package" --config "$config"
+  catalog install wjixiang/catalog-magma-gene-loc-ncbi37-3
 else
   cleanup_paths=()
   cleanup() {
@@ -95,9 +96,12 @@ else
   trap cleanup EXIT
 fi
 
-current=$(catalog list --config "$config")
+# Presence check against the local panel cache — what the loader mounts
+# from. (The remote search subcommand trips over an unrelated malformed
+# package index in the current catalog generation.)
+current=$(catalog list --cache "$AUTONOMICS_PANEL_CACHE_ROOT")
 grep -q '"repo": "wjixiang/catalog-magma-gene-loc-ncbi37-3"' <<<"$current" || {
-  echo "catalog current index is missing wjixiang/catalog-magma-gene-loc-ncbi37-3" >&2
+  echo "local panel cache is missing wjixiang/catalog-magma-gene-loc-ncbi37-3 (publish it with PUBLISH_PANEL=1)" >&2
   exit 1
 }
 

@@ -11,6 +11,19 @@ binding = "gene_loc"
 mount = "/panels/gene_loc"
 bundle = "wjixiang/catalog-magma-gene-loc-ncbi37-3"
 
+# Official MAGMA-distributed 1000 Genomes Phase 3 EUR reference (GRCh37,
+# 503 samples, one whole-genome .bed/.bim/.fam prefix plus the .synonyms
+# file MAGMA auto-detects next to it for rsID remapping). The mixer
+# signed-LD panel carries chr:pos:allele BIM IDs that never align with
+# rsID sumstats, and the chromosome-split QC plink-ref panel ships no
+# .synonyms and would force 22 runs per analysis, so this family binds
+# its own panel. v0 panels are family-level (smr precedent): both new
+# kinds mount it, only magma_gene_analysis reads it.
+[[panels]]
+binding = "magma_ref"
+mount = "/panels/magma_ref"
+bundle = "wjixiang/catalog-magma-ref-g1000-eur"
+
 [[nodes]]
 kind = "magma_annotate"
 desc = "Runs official MAGMA v1.10 SNP-to-gene annotation in Podman."
@@ -36,3 +49,147 @@ outputs = [
 [nodes.command]
 interpreter = "sh"
 script_file = "scripts/annotate.sh"
+
+[[nodes]]
+kind = "magma_gene_analysis"
+desc = "Runs official MAGMA v1.10 gene-level analysis of SNP p-values in Podman."
+doc = """
+Runs the official MAGMA v1.10 static executable for the summary-statistics
+gene analysis `magma --bfile <ref> --pval <file> --gene-annot <annot>` in an
+ephemeral container.
+
+Input ports:
+- port 0: GWAS summary statistics, one tab- or space-separated File (gzip
+  accepted) with a header naming the SNP (rsID) and P columns; MAGMA
+  auto-detects both by name. An additional N column (per-SNP sample size)
+  is used when present.
+- port 1: gene annotation File, the `.genes.annot` output of
+  magma_annotate port 1. Gene IDs are NCBI37.3 Entrez numeric IDs.
+
+The LD reference is the family panel at /panels/magma_ref: the official
+MAGMA-distributed 1000G EUR whole-genome bfile with its .synonyms file
+(rsID remapping; auto-detected by MAGMA). rsIDs in the sumstats are
+matched against the reference, SNPs without p-values are skipped, and
+genes with no testable SNPs are dropped by MAGMA itself.
+
+Parameters:
+- model selects the official --gene-model value. With p-value input the
+  official default is snp-wise=mean; multi is the official aggregate of
+  the snp-wise mean and top models (recommended for mixed architectures).
+  NOTE the design-doc assumption "multi = principal-components regression"
+  does not hold for summary statistics: the linreg PC model requires raw
+  genotype data (v1.10 manual), so no n_pc-style parameter exists.
+- top_n (>=1) turns model=snp-wise=top into snp-wise=top,K, the mean of
+  the K most significant SNPs; it is rejected for any other model.
+- sample_size is the fixed GWAS N passed as N=... when the sumstats carry
+  no N column (required then; ignored when they do).
+
+Outputs: port 0 magma_gene_analysis.genes.out (GENE, CHR, START, STOP,
+NSNPS, NPARAM, N, ZSTAT, P; multi also reports the component p-values),
+port 1 magma_gene_analysis.genes.raw (the intermediate MAGMA requires as
+--gene-results input for gene-set analysis — feed it to magma_gene_set
+port 0), and port 2 the complete MAGMA log. The reported P is the model's
+aggregate p-value and is what downstream GSA consumes.
+"""
+timeout_secs = 14400
+artifact_prefix = "/artifacts/magma_gene_analysis"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "gwas_sumstats", accepted_formats = ["tsv", "txt", "gz"] },
+  { type = "file", label = "gene_annotation", accepted_formats = ["tsv", "txt"] },
+]
+outputs = [
+  { path = "magma_gene_analysis.genes.out", format = "magma_genes_out" },
+  { path = "magma_gene_analysis.genes.raw", format = "magma_genes_raw" },
+  { path = "magma_gene_analysis.log", format = "magma_log" },
+]
+
+[nodes.params]
+# v0 has no enum param type; the script rejects values outside
+# multi / snp-wise=mean / snp-wise=top with the lava-style message.
+model = { type = "string", default = "multi", doc = "Official --gene-model value: multi (aggregate of mean and top), snp-wise=mean, or snp-wise=top" }
+top_n = { type = "int", optional = true, min = 1.0, doc = "Mean of the K most significant SNPs; requires and decorates model=snp-wise=top" }
+sample_size = { type = "int", optional = true, min = 1.0, doc = "Fixed GWAS sample size for MAGMA N=...; required when the sumstats have no N column" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/gene_analysis.sh"
+
+[nodes.command.env]
+MAGMA_GENE_MODEL = "{{ model }}"
+MAGMA_TOP_N = "{{ top_n }}"
+MAGMA_SAMPLE_SIZE = "{{ sample_size }}"
+
+# Whole-genome reference load (22.3M SNPs, 2.9GB .bed) plus per-gene
+# regression. The earlier dev-lifecycle attempt observed the multi model
+# exceeding 8Gi on dense chromosomes with a per-chromosome panel; the
+# whole-genome panel loads the same per-chromosome windows, so 16Gi keeps
+# headroom.
+[nodes.resources]
+cpus = 2.0
+memory = "16Gi"
+pids_limit = 512
+
+[[nodes]]
+kind = "magma_gene_set"
+desc = "Runs official MAGMA v1.10 competitive gene-set analysis in Podman."
+doc = """
+Runs the official MAGMA v1.10 competitive gene-set analysis
+`magma --gene-results <raw> --set-annot <sets>` in an ephemeral container.
+
+Input ports:
+- port 0: gene analysis results File, the `.genes.raw` output port 1 of
+  magma_gene_analysis. (.genes.out is the human-readable table and is NOT
+  accepted by --gene-results; the raw file is what MAGMA designed GSA to
+  read.)
+- port 1: gene-set File, either MAGMA row format (one line per set: name
+  followed by gene IDs) or GMT (name, description, genes). Files pass
+  through untouched: MAGMA itself discards values that match no gene, so a
+  GMT description column is dropped by the official reader. Gene IDs must
+  be NCBI37.3 Entrez numeric IDs — use the Entrez editions of MSigDB GMTs
+  (symbol editions need upstream mapping; symbols never match numeric
+  Entrez IDs).
+
+The competitive test regresses gene Z-statistics on set membership with
+automatic correction for technical confounders (gene size/SNP count,
+within-gene LD density, minor-allele count, sample size). v1.10 computes
+it analytically — there is no permutation or minimum-set-size flag, and
+none is emulated; NGENES is reported per set so filtering happens
+downstream.
+
+Outputs: port 0 magma_gene_set.gsa.out (VARIABLE, TYPE, NGENES, BETA,
+BETA_STD, SE, P) and port 1 the complete MAGMA log. This is the
+LD-and-gene-size-aware alternative to Enrichr-style over-representation
+tests; unlike Enrichr it uses every gene's statistic, not a top-N list.
+"""
+timeout_secs = 1800
+artifact_prefix = "/artifacts/magma_gene_set"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "gene_results_raw", accepted_formats = ["tsv", "txt"] },
+  { type = "file", label = "gene_sets", accepted_formats = ["gmt", "tsv", "txt"] },
+]
+outputs = [
+  { path = "magma_gene_set.gsa.out", format = "magma_gsa_out" },
+  { path = "magma_gene_set.log", format = "magma_log" },
+]
+
+[nodes.params]
+# Unset means the official defaults (correct=all). The script rejects
+# anything but all/none; the per-variable include/exclude lists are the
+# recorded not-exposed surface.
+correct = { type = "string", optional = true, doc = "Technical covariate correction: all (official default) or none" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/gene_set.sh"
+
+[nodes.command.env]
+MAGMA_GENE_SET_CORRECT = "{{ correct }}"
+
+[nodes.resources]
+cpus = 2.0
+memory = "4Gi"
+pids_limit = 512
