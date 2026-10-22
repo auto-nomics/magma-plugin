@@ -76,14 +76,20 @@ esac
   exit 1
 }
 
-prefix="$AUTONOMICS_WORKDIR/magma_gene_analysis"
+# The runner sets AUTONOMICS_OUTPUT<n> to /work/<declared port path> and
+# AUTONOMICS_WORKDIR to /work. Using a /work --out prefix that coincides
+# with a port path would make the moves below self-moves, and MAGMA's own
+# prefix.log would land on the log port while stdout is also redirected
+# there. Stage under a private subdirectory and copy onto the ports.
+stage="$AUTONOMICS_WORKDIR/.magma_stage/gene_analysis"
+mkdir -p "$stage"
 
 {
   echo "magma_gene_analysis: model=$model, $nnote"
   if [ "$batches" -gt 1 ]; then
     echo "batches=$batches (concurrent MAGMA --batch runs, merged afterwards)"
   fi
-} > "$AUTONOMICS_OUTPUT2" 2>&1
+} > "$stage/run.log" 2>&1
 
 if [ "$batches" -eq 1 ]; then
   magma \
@@ -91,7 +97,7 @@ if [ "$batches" -eq 1 ]; then
     --pval "$sumstats" "$nmode" \
     --gene-annot "$AUTONOMICS_INPUT1" \
     --gene-model "$model" \
-    --out "$prefix" >> "$AUTONOMICS_OUTPUT2" 2>&1
+    --out "$stage/magma_gene_analysis" >> "$stage/run.log" 2>&1
 else
   # Every batch MUST get the identical command and --out prefix: MAGMA keys
   # the per-batch files off that prefix (.batchP_N.genes.out) and --merge
@@ -105,7 +111,7 @@ else
       --gene-annot "$AUTONOMICS_INPUT1" \
       --gene-model "$model" \
       --batch "$b" "$batches" \
-      --out "$prefix" >> "$AUTONOMICS_OUTPUT2" 2>&1 &
+      --out "$stage/magma_gene_analysis" >> "$stage/run.log" 2>&1 &
     pids="$pids $b=$!"
     b=$((b + 1))
   done
@@ -125,7 +131,7 @@ else
   # a confusing count mismatch; name the missing one here instead.
   b=1
   while [ "$b" -le "$batches" ]; do
-    if [ ! -s "$prefix.batch${b}_${batches}.genes.out" ]; then
+    if [ ! -s "$stage/magma_gene_analysis.batch${b}_${batches}.genes.out" ]; then
       echo "batches=$batches: batch $b produced no .genes.out. The v1.10 manual caps" >&2
       echo "batch mode at roughly 25-30 batches (gene-gene correlation distances);" >&2
       echo "reduce batches or check the log for that batch." >&2
@@ -134,14 +140,14 @@ else
     b=$((b + 1))
   done
   magma \
-    --merge "$prefix" \
-    --out "$prefix" >> "$AUTONOMICS_OUTPUT2" 2>&1
+    --merge "$stage/magma_gene_analysis" \
+    --out "$stage/magma_gene_analysis" >> "$stage/run.log" 2>&1
 fi
 
-# Move the official products onto the declared output ports explicitly
-# rather than relying on the runner to collect the workdir prefix.
-mv -f "$AUTONOMICS_WORKDIR/magma_gene_analysis.genes.out" "$AUTONOMICS_OUTPUT0"
-mv -f "$AUTONOMICS_WORKDIR/magma_gene_analysis.genes.raw" "$AUTONOMICS_OUTPUT1"
+mv -f "$stage/magma_gene_analysis.genes.out" "$AUTONOMICS_OUTPUT0"
+mv -f "$stage/magma_gene_analysis.genes.raw" "$AUTONOMICS_OUTPUT1"
+mv -f "$stage/run.log" "$AUTONOMICS_OUTPUT2"
+rm -rf "$AUTONOMICS_WORKDIR/.magma_stage"
 test -s "$AUTONOMICS_OUTPUT0"
 test -s "$AUTONOMICS_OUTPUT1"
 

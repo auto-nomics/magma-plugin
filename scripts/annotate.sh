@@ -93,16 +93,21 @@ awk -v label="$(basename "$snp_loc")" '
   }
 ' "$snp_loc" >&2
 
-prefix="$AUTONOMICS_WORKDIR/magma_annotate"
+# The runner sets AUTONOMICS_OUTPUT<n> to /work/<declared port path> and
+# AUTONOMICS_WORKDIR to /work, so a /work --out prefix that coincides with a
+# port path makes the move below a self-move. Stage under a private
+# subdirectory and copy onto the ports.
+stage="$AUTONOMICS_WORKDIR/.magma_stage/annotate"
+mkdir -p "$stage"
 
 magma \
   --annotate $MODS \
   --snp-loc "$snp_loc" \
   --gene-loc /panels/gene_loc/NCBI37.3.gene.loc \
-  --out "$prefix" \
-  > "$AUTONOMICS_OUTPUT0" 2>&1
+  --out "$stage/magma_annotate" \
+  > "$stage/run.log" 2>&1
 
-# Move the official products onto the declared output ports explicitly
-# rather than relying on the runner to collect the workdir prefix.
-mv -f "$prefix.genes.annot" "$AUTONOMICS_OUTPUT1"
+mv -f "$stage/magma_annotate.genes.annot" "$AUTONOMICS_OUTPUT1"
+mv -f "$stage/run.log" "$AUTONOMICS_OUTPUT0"
+rm -rf "$AUTONOMICS_WORKDIR/.magma_stage"
 test -s "$AUTONOMICS_OUTPUT1"

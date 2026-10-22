@@ -44,16 +44,24 @@ if [ "${2:-0}" -gt "${1:-0}" ]; then
   exit 1
 fi
 
+# The runner sets AUTONOMICS_OUTPUT<n> to /work/<declared port path>, and
+# AUTONOMICS_WORKDIR to /work — so writing MAGMA straight to a /work prefix
+# that happens to equal a port path would make the move below a self-move
+# ("mv: same file"). Stage under a private subdirectory and copy onto the
+# ports afterwards; never assume the two differ.
+stage="$AUTONOMICS_WORKDIR/.magma_stage/gene_set"
+mkdir -p "$stage"
+
 magma \
   --gene-results "$AUTONOMICS_INPUT0" \
   --set-annot "$AUTONOMICS_INPUT1" \
   $ARGS \
-  --out "$AUTONOMICS_WORKDIR/magma_gene_set" \
-  > "$AUTONOMICS_OUTPUT1" 2>&1
+  --out "$stage/magma_gene_set" \
+  > "$stage/run.log" 2>&1
 
-# Move the official product onto the declared output port explicitly rather
-# than relying on the runner to collect the workdir prefix.
-mv -f "$AUTONOMICS_WORKDIR/magma_gene_set.gsa.out" "$AUTONOMICS_OUTPUT0"
+mv -f "$stage/magma_gene_set.gsa.out" "$AUTONOMICS_OUTPUT0"
+mv -f "$stage/run.log" "$AUTONOMICS_OUTPUT1"
+rm -rf "$AUTONOMICS_WORKDIR/.magma_stage"
 test -s "$AUTONOMICS_OUTPUT0"
 
 # Silent all-zero results are the other GSA failure mode (a .genes.raw from
